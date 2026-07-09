@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,6 +25,108 @@ type Poll struct {
 }
 
 var dbPool *pgxpool.Pool
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+var clients = make(map[*websocket.Conn]bool)
+
+var clientsMu sync.Mutex
+
+func broadcastPollState() {
+	ctx := context.Background()
+	var poll Poll
+
+	err := dbPool.QueryRow(ctx, "SELECT id, question FROM polls WHERE id = $1", 1).Scan(&poll.ID, &poll.Question)
+	if err != nil {
+		slog.Error("Broadcast: Getting poll error", "error", err)
+		return
+	}
+
+	rows, err := dbPool.Query(ctx, "SELECT id, text, votes FROM options WHERE poll_id = $1 ORDER BY id", poll.ID)
+	if err != nil {
+		slog.Error("Broadcast: Getting options error", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var opt Option
+		rows.Scan(&opt.ID, &opt.Text, &opt.Votes)
+		poll.Options = append(poll.Options, opt)
+	}
+
+	jsonData, err := json.Marshal(poll)
+	if err != nil {
+		slog.Error("Broadcast: Marshaling JSON error", "error", err)
+		return
+	}
+
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	for client := range clients {
+		err := client.WriteMessage(websocket.TextMessage, jsonData)
+		if err != nil {
+			slog.Warn("Unable to send message to client. Closing connection", "error", err)
+			client.Close()
+			delete(clients, client)
+		}
+	}
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		slog.Error("Upgrade error in WebSocket", "error", err)
+		return
+	}
+
+	clientsMu.Lock()
+	clients[conn] = true
+	clientsMu.Unlock()
+	slog.Info("New client connected via WebSocket", "addr", conn.RemoteAddr())
+
+	go broadcastPollState()
+
+	go func() {
+		defer func() {
+			clientsMu.Lock()
+			delete(clients, conn)
+			clientsMu.Unlock()
+			conn.Close()
+			slog.Info("Client disconnected", "addr", conn.RemoteAddr())
+		}()
+
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+
+			var voteReq struct {
+				OptionID int `json:"option_id"`
+			}
+
+			if err := json.Unmarshal(message, &voteReq); err != nil {
+				slog.Warn("Incorrect client message format", "error", err)
+				continue
+			}
+
+			slog.Info("Got vote", "option_id", voteReq.OptionID)
+
+			_, err = dbPool.Exec(context.Background(),
+				"UPDATE options SET votes = votes + 1 WHERE id = $1", voteReq.OptionID)
+			if err != nil {
+				slog.Error("Update vote database error", "error", err)
+				continue
+			}
+
+			go broadcastPollState()
+		}
+	}()
+}
 
 func getPollHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -82,6 +186,7 @@ func main() {
 	slog.Info("Successful connection to PostgreSQL")
 
 	http.HandleFunc("/api/poll", getPollHandler)
+	http.HandleFunc("/ws", wsHandler)
 
 	port := ":8080"
 	slog.Info("Server successfully start", "port", port)
