@@ -166,7 +166,10 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	connStr := "postgres://myuser:mypassword@localhost:5433/mydb?sslmode=disable"
+	connStr := os.Getenv("DB_URL")
+	if connStr == "" {
+		connStr = "postgres://postgres:mypassword@127.0.0.1:5433/mydb?sslmode=disable"
+	}
 
 	ctx := context.Background()
 	var err error

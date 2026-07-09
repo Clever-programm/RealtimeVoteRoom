@@ -35,7 +35,8 @@ class _PollPageState extends State<PollPage> {
   @override
   void initState() {
     super.initState();
-    _channel = WebSocketChannel.connect(Uri.parse('ws://localhost:8080/ws'));
+    final host = Uri.base.host;
+    _channel = WebSocketChannel.connect(Uri.parse('ws://$host:8080/ws'));
   }
 
   @override
